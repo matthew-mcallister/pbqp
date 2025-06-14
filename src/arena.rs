@@ -2,7 +2,7 @@ use std::mem::ManuallyDrop;
 
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
-struct Id(u64);
+pub struct Id(u64);
 
 impl Id {
     fn new(index: u32, generation: u32) -> Self {
@@ -99,7 +99,6 @@ impl<T> Drop for Entry<T> {
 }
 
 /// Generational arena.
-#[derive(Default)]
 pub struct Arena<T> {
     // Number of elements/occupied entries
     len: usize,
@@ -115,13 +114,21 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Arena<T> {
     }
 }
 
-impl<T: Default> Arena<T> {
-    pub fn new() -> Self {
-        Default::default()
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Arena {
+            len: 0,
+            free_head: 0,
+            entries: Vec::new(),
+        }
     }
 }
 
 impl<T> Arena<T> {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

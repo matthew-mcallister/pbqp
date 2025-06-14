@@ -2,7 +2,7 @@ use std::mem::ManuallyDrop;
 
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
-struct Id(u64);
+pub struct Id(u64);
 
 impl Id {
     fn new(index: u32, generation: u32) -> Self {

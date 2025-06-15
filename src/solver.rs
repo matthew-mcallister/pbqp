@@ -1,6 +1,7 @@
 // TODO maybe: Arena memory allocation
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::arena::{Arena, Id};
 use crate::math::Matrix;
@@ -114,6 +115,7 @@ impl Problem {
     }
 
     /// Computes a lower bound on the problem solution
+    // XXX: Could implement R0, R1, R2 reductions here
     fn lower_bound(&self) -> u32 {
         let mut lower_bound: u32 = 0;
         for u in 0..self.len() {
@@ -198,11 +200,12 @@ fn solve_greedy(problem: &Problem) -> Vec<u8> {
 /// lower bound on branching after coloring node k.
 ///
 /// This is only needed for initializing the solver after computing the greedy
-/// solution; we keep track of the lower bound of each branch while searching.
+/// solution; during search, we already keep track of the lower bound of each
+/// branch
 fn compute_lower_bound(problem: &Problem, solution: &[u8], global_lower_bound: u32) -> Vec<u32> {
-    // Recurrence relation behind all lower bound calculations:
+    // Recurrence relation behind lower bound calculations:
     //  lower_bound[0] = global_lower_bound
-    //  lower_bound[k + 1] = lower_bound[k] + (cost_of_k_and_back_edges - node_lower_bound_of_k)
+    //  lower_bound[k + 1] = lower_bound[k] + (cost_of_node_k_and_back_edges - node_lower_bound_of_k)
     let n = solution.len();
     let mut lower_bound = Vec::new();
     let mut prev = global_lower_bound;
@@ -245,11 +248,28 @@ struct Instance {
     // - skiplist.len() is the largest power of two that divides index
     // - skiplist[k] points 2^k nodes prior
     skiplist: Vec<Id>,
+    // TODO: reference count so we can trim dead branches.
+}
+
+impl Instance {
+    fn new(parent: Id, index: u32, color: u8, lower_bound: u32) -> Self {
+        Self {
+            index,
+            color,
+            lower_bound,
+            skiplist: vec![parent],
+        }
+    }
+
+    fn parent(&self) -> Id {
+        self.skiplist[0]
+    }
 }
 
 #[derive(Debug, Default)]
 struct SearchTree {
     instances: Arena<Instance>,
+    queue: BinaryHeap<Reverse<(u32, Id)>>,
 }
 
 impl SearchTree {
@@ -272,20 +292,28 @@ impl SearchTree {
         cur_id
     }
 
-    /// Inserts a new instance into the tree beneath the given parent instance.
-    /// Its skiplist will be generated automatically.
-    fn insert(&mut self, mut instance: Instance, parent: Id) -> Id {
+    /// Inserts a new instance into the tree beneath. Its skiplist will be
+    /// updated if needed.
+    fn insert(&mut self, mut instance: Instance) -> Id {
         let instances = &self.instances;
-        let mut cur_id = parent;
+
+        // Update skiplist
+        let mut cur_id = instance.parent();
         let mut cur = &instances[cur_id];
         debug_assert_eq!(cur.index, instance.index + 1);
-        let k = instance.index.trailing_zeros() as usize + 1;
+        // k = maximum int such that 2^k divides index
+        let k = instance.index.trailing_zeros() as usize;
         for _ in 0..k {
             instance.skiplist.push(cur_id);
             cur_id = cur.skiplist[k];
             cur = &instances[cur_id];
         }
-        self.instances.insert(instance)
+
+        let lb = instance.lower_bound;
+        let id = self.instances.insert(instance);
+        self.queue.push(Reverse((lb, id)));
+
+        id
     }
 }
 
@@ -294,6 +322,7 @@ pub struct Solver {
     problem: Problem,
     global_lower_bound: u32,
     best_solution: Vec<u8>,
+    // XXX: Will this make for a good heuristic?
     solution_lower_bound: Vec<u32>,
     search_tree: SearchTree,
 }
@@ -315,8 +344,89 @@ impl Solver {
         }
     }
 
+    fn upper_bound(&self) -> u32 {
+        *self.solution_lower_bound.last().unwrap()
+    }
+
+    /// Replaces the current solution with the solution ending in the given
+    /// instance.
+    fn replace_solution(&mut self, instance: Instance) {
+        let mut solution = vec![instance.color];
+        let mut lower_bound = vec![instance.lower_bound];
+        let mut cur_id = instance.parent();
+        for _ in 0..instance.index {
+            let inst = &self.search_tree.instances[cur_id];
+            solution.push(inst.color);
+            lower_bound.push(inst.lower_bound);
+            cur_id = inst.parent();
+        }
+
+        solution.reverse();
+        lower_bound.reverse();
+
+        self.best_solution = solution;
+        self.solution_lower_bound = lower_bound;
+    }
+
+    /// Given a parent instance, explore all possible subproblems
+    fn branch(&mut self, parent_id: Id) {
+        let k = self.search_tree.instances[parent_id].index + 1;
+
+        let back_edges: Vec<(u32, Id, Matrix<u32>)> = self.problem.edge_cost[k as usize]
+            .iter()
+            .map(|&(v, ref matrix)| {
+                let id = self.search_tree.find_ancestor(parent_id, v);
+                (v, id, matrix.clone())
+            })
+            .collect();
+        for color in 0..self.problem.node_cost[k as usize].len() {
+            let parent = &self.search_tree.instances[parent_id];
+
+            let mut cost = self.problem.node_cost[k as usize][color as usize];
+            for &(_v, id, ref matrix) in back_edges.iter() {
+                let ancestor = &self.search_tree.instances[id];
+                let color_v = ancestor.color as usize;
+                cost = cost.saturating_add(matrix[color][color_v]);
+            }
+            let node_lb = self.problem.node_lower_bound(k);
+            let lower_bound = parent.lower_bound.saturating_add(cost - node_lb);
+
+            if lower_bound >= self.upper_bound() {
+                // Prune branch
+                return;
+            }
+
+            let instance = Instance::new(parent_id, k, color as u8, lower_bound);
+            if (k as usize) == self.problem.len() - 1 {
+                // Last node, check if this is a better solution
+                if lower_bound < self.upper_bound() {
+                    self.replace_solution(instance);
+                }
+            } else {
+                // Not last node, add to queue for further branching
+                let id = self.search_tree.insert(instance);
+                self.search_tree.queue.push(Reverse((lower_bound, id)));
+            }
+        }
+    }
+
     pub fn solve(&mut self) {
-        todo!()
+        // Initialize
+        let min_cost = self.problem.node_cost[0].iter().copied().min().unwrap();
+        for (color, &cost) in self.problem.node_cost[0].iter().enumerate() {
+            let lower_bound = self.global_lower_bound + cost - min_cost;
+            let instance = Instance::new(Id::null(), 0, color as u8, lower_bound);
+            self.search_tree.insert(instance);
+        }
+
+        // TODO: Stopping heuristic
+        while let Some(Reverse((_, instance_id))) = self.search_tree.queue.pop() {
+            self.branch(instance_id);
+        }
+    }
+
+    pub fn solution(&self) -> &[u8] {
+        &self.best_solution[..]
     }
 }
 

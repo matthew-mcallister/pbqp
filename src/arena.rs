@@ -9,6 +9,11 @@ impl Id {
         Id(((generation as u64) << 32) | (index as u64))
     }
 
+    pub fn null() -> Self {
+        // Always invalid because generation is even
+        Id(0)
+    }
+
     fn index(self) -> u32 {
         self.0 as u32
     }

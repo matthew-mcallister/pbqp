@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Slice<'a, T> {
     storage: &'a [T],
@@ -32,7 +34,7 @@ impl<'a, T> Iterator for Slice<'a, T> {
 /// Copy-on-write matrix type.
 #[derive(Clone, Debug)]
 pub struct Matrix<T> {
-    storage: Vec<T>,
+    storage: Rc<Vec<T>>,
     rows: u32,
     cols: u32,
 }
@@ -44,7 +46,7 @@ impl<T> Matrix<T> {
             .flat_map(|inner| inner.into_iter())
             .collect();
         Self {
-            storage,
+            storage: Rc::new(storage),
             rows: M as u32,
             cols: N as u32,
         }
@@ -53,7 +55,7 @@ impl<T> Matrix<T> {
     pub fn new(elems: Vec<T>, rows: u32, cols: u32) -> Self {
         assert_eq!(elems.len() as u32, rows * cols);
         Self {
-            storage: elems,
+            storage: Rc::new(elems),
             rows,
             cols,
         }

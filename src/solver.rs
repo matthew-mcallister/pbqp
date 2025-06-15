@@ -2,8 +2,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::rc::Rc;
 
-use crate::arena::{Arena, Id};
 use crate::math::Matrix;
 
 /// Input to the PBQP solver.
@@ -115,7 +115,6 @@ impl Problem {
     }
 
     /// Computes a lower bound on the problem solution
-    // XXX: Could implement R0, R1, R2 reductions here
     fn lower_bound(&self) -> u32 {
         let mut lower_bound: u32 = 0;
         for u in 0..self.len() {
@@ -247,73 +246,77 @@ struct Instance {
     // Skiplist implementation:
     // - skiplist.len() is the largest power of two that divides index
     // - skiplist[k] points 2^k nodes prior
-    skiplist: Vec<Id>,
-    // TODO: reference count so we can trim dead branches.
+    // TODO: We can trade memory for time if every node has pointers pointing
+    // 1, 2, 4, 8... nodes above
+    skiplist: Vec<Rc<Instance>>,
 }
 
 impl Instance {
-    fn new(parent: Id, index: u32, color: u8, lower_bound: u32) -> Self {
+    fn new(index: u32, color: u8, lower_bound: u32) -> Self {
         Self {
             index,
             color,
             lower_bound,
-            skiplist: vec![parent],
+            skiplist: Vec::new(),
         }
     }
 
-    fn parent(&self) -> Id {
-        self.skiplist[0]
+    fn parent(&self) -> &Rc<Instance> {
+        &self.skiplist[0]
     }
-}
 
-#[derive(Debug, Default)]
-struct SearchTree {
-    instances: Arena<Instance>,
-    queue: BinaryHeap<Reverse<(u32, Id)>>,
-}
-
-impl SearchTree {
     /// Finds the ancestor of an instance where the given node index was
     /// visited.
-    fn find_ancestor(&self, instance_id: Id, target_index: u32) -> Id {
-        let instances = &self.instances;
-
-        let mut cur_id = instance_id;
-        let mut cur = &instances[cur_id];
+    fn find_ancestor(&self, target_index: u32) -> &Self {
+        let mut cur = self;
         let mut cur_index = cur.index;
         while cur_index > target_index {
             let diff = cur_index - target_index;
             let k = std::cmp::min(diff.ilog2() as usize, cur.skiplist.len() - 1);
-            cur_id = cur.skiplist[k];
-            cur = &instances[cur_id];
+            cur = &*cur.skiplist[k];
             cur_index = cur.index;
         }
 
-        cur_id
+        cur
     }
 
-    /// Inserts a new instance into the tree beneath. Its skiplist will be
-    /// updated if needed.
-    fn insert(&mut self, mut instance: Instance) -> Id {
-        let instances = &self.instances;
-
-        // Update skiplist
-        let mut cur_id = instance.parent();
-        let mut cur = &instances[cur_id];
-        debug_assert_eq!(cur.index, instance.index + 1);
+    /// Inserts a new instance into the tree beneath the current instance. Its
+    /// skiplist will be filled automatically.
+    fn insert_child(self: &Rc<Self>, mut instance: Instance) -> Rc<Instance> {
+        debug_assert_eq!(instance.index, self.index + 1);
+        instance.skiplist.push(Rc::clone(self));
         // k = maximum int such that 2^k divides index
         let k = instance.index.trailing_zeros() as usize;
+        let mut cur = self;
         for _ in 0..k {
-            instance.skiplist.push(cur_id);
-            cur_id = cur.skiplist[k];
-            cur = &instances[cur_id];
+            cur = &cur.skiplist[k];
+            instance.skiplist.push(Rc::clone(cur));
         }
+        Rc::new(instance)
+    }
+}
 
-        let lb = instance.lower_bound;
-        let id = self.instances.insert(instance);
-        self.queue.push(Reverse((lb, id)));
+/// Wrapper around Instance which provides comparison based on lower bound.
+#[derive(Debug)]
+struct InstanceOrd(Rc<Instance>);
 
-        id
+impl PartialEq for InstanceOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.lower_bound == other.0.lower_bound
+    }
+}
+
+impl Eq for InstanceOrd {}
+
+impl PartialOrd for InstanceOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InstanceOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.lower_bound.cmp(&other.0.lower_bound)
     }
 }
 
@@ -324,7 +327,7 @@ pub struct Solver {
     best_solution: Vec<u8>,
     // XXX: Will this make for a good heuristic?
     solution_lower_bound: Vec<u32>,
-    search_tree: SearchTree,
+    queue: BinaryHeap<Reverse<InstanceOrd>>,
 }
 
 impl Solver {
@@ -340,7 +343,7 @@ impl Solver {
             global_lower_bound,
             best_solution,
             solution_lower_bound,
-            search_tree: Default::default(),
+            queue: Default::default(),
         }
     }
 
@@ -350,15 +353,13 @@ impl Solver {
 
     /// Replaces the current solution with the solution ending in the given
     /// instance.
-    fn replace_solution(&mut self, instance: Instance) {
+    fn replace_solution(&mut self, mut instance: &Instance) {
         let mut solution = vec![instance.color];
         let mut lower_bound = vec![instance.lower_bound];
-        let mut cur_id = instance.parent();
         for _ in 0..instance.index {
-            let inst = &self.search_tree.instances[cur_id];
-            solution.push(inst.color);
-            lower_bound.push(inst.lower_bound);
-            cur_id = inst.parent();
+            instance = instance.parent();
+            solution.push(instance.color);
+            lower_bound.push(instance.lower_bound);
         }
 
         solution.reverse();
@@ -369,23 +370,24 @@ impl Solver {
     }
 
     /// Given a parent instance, explore all possible subproblems
-    fn branch(&mut self, parent_id: Id) {
-        let k = self.search_tree.instances[parent_id].index + 1;
+    fn branch(&mut self, parent: &Rc<Instance>) {
+        assert!((parent.index as usize) < self.problem.len() - 1);
+        let k = parent.index + 1;
 
-        let back_edges: Vec<(u32, Id, Matrix<u32>)> = self.problem.edge_cost[k as usize]
+        // TODO: Instead of starting each lookup from the current instance,
+        // ensure the nodes are sorted and start each lookup from the previous
+        // instance visited. This gives worst-case O(n) lookup time.
+        let back_edges: Vec<(&Instance, Matrix<u32>)> = self.problem.edge_cost[k as usize]
             .iter()
             .map(|&(v, ref matrix)| {
-                let id = self.search_tree.find_ancestor(parent_id, v);
-                (v, id, matrix.clone())
+                let inst = parent.find_ancestor(v);
+                (inst, matrix.clone())
             })
             .collect();
         for color in 0..self.problem.node_cost[k as usize].len() {
-            let parent = &self.search_tree.instances[parent_id];
-
             let mut cost = self.problem.node_cost[k as usize][color as usize];
-            for &(_v, id, ref matrix) in back_edges.iter() {
-                let ancestor = &self.search_tree.instances[id];
-                let color_v = ancestor.color as usize;
+            for &(instance, ref matrix) in back_edges.iter() {
+                let color_v = instance.color as usize;
                 cost = cost.saturating_add(matrix[color][color_v]);
             }
             let node_lb = self.problem.node_lower_bound(k);
@@ -396,16 +398,17 @@ impl Solver {
                 return;
             }
 
-            let instance = Instance::new(parent_id, k, color as u8, lower_bound);
+            let instance = Instance::new(k, color as u8, lower_bound);
             if (k as usize) == self.problem.len() - 1 {
                 // Last node, check if this is a better solution
                 if lower_bound < self.upper_bound() {
-                    self.replace_solution(instance);
+                    let instance = parent.insert_child(instance);
+                    self.replace_solution(&instance);
                 }
             } else {
                 // Not last node, add to queue for further branching
-                let id = self.search_tree.insert(instance);
-                self.search_tree.queue.push(Reverse((lower_bound, id)));
+                let instance = parent.insert_child(instance);
+                self.queue.push(Reverse(InstanceOrd(instance)));
             }
         }
     }
@@ -415,13 +418,13 @@ impl Solver {
         let min_cost = self.problem.node_cost[0].iter().copied().min().unwrap();
         for (color, &cost) in self.problem.node_cost[0].iter().enumerate() {
             let lower_bound = self.global_lower_bound + cost - min_cost;
-            let instance = Instance::new(Id::null(), 0, color as u8, lower_bound);
-            self.search_tree.insert(instance);
+            let instance = Instance::new(0, color as u8, lower_bound);
+            self.queue.push(Reverse(InstanceOrd(Rc::new(instance))));
         }
 
         // TODO: Stopping heuristic
-        while let Some(Reverse((_, instance_id))) = self.search_tree.queue.pop() {
-            self.branch(instance_id);
+        while let Some(Reverse(InstanceOrd(instance))) = self.queue.pop() {
+            self.branch(&instance);
         }
     }
 

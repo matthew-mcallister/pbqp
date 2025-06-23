@@ -1,6 +1,6 @@
-[package]
-name = "pbqp"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "3"
+members = ["crates/codegen", "crates/core"]
 
-[dependencies]
+[profile.dev.build-override]
+debug = true

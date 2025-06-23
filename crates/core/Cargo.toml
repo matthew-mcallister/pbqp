@@ -1,0 +1,14 @@
+[package]
+name = "rcc_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fnv = "1.0.7"
+postcard = "1.1.3"
+rcc_codegen = { path = "../codegen" }
+smallvec = "1.15.1"
+
+[build-dependencies]
+postcard = "1.1.3"
+rcc_codegen = { path = "../codegen" }

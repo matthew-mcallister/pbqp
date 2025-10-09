@@ -11,5 +11,5 @@ fn main() {
     let file = BufWriter::new(file);
     let lut = solve_shuffles();
     println!("writing to {:?}", path);
-    serialize_lut(lut, file);
+    serialize_lut(&lut, file).unwrap();
 }

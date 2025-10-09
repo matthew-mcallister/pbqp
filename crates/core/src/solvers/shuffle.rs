@@ -3,7 +3,8 @@ use std::iter::FusedIterator;
 use fnv::FnvHashMap as HashMap;
 use rcc_codegen::const_vec::{ConstMap, ConstVec};
 use rcc_codegen::shuffle::{
-    EntryMap, Input as ShuffleInput, RegisterShuffleEntry, ShuffleInstr, State as ShuffleState,
+    EntryIndexer, Input as ShuffleInput, RegisterShuffleEntry, ShuffleInstr, State as ShuffleState,
+    deserialize_lut,
 };
 
 use crate::common::macro_instr::Register;
@@ -11,8 +12,29 @@ use crate::common::ssa_model::{Function, Variable};
 use crate::solvers::block::{StackState, State};
 
 #[derive(Debug)]
+struct EntryMap {
+    indexer: EntryIndexer,
+    data: Vec<u8>,
+}
+
+impl EntryMap {
+    fn new(input: &ShuffleInput, data: Vec<u8>) -> Self {
+        let indexer = EntryIndexer::new(input);
+        Self { indexer, data }
+    }
+
+    fn get(&self, state: &ShuffleState) -> RegisterShuffleEntry {
+        let idx = self.indexer.index(&state);
+        let start = idx as usize * RegisterShuffleEntry::SIZE;
+        let end = start + RegisterShuffleEntry::SIZE;
+        let bytes: [u8; 12] = self.data[start..end].try_into().unwrap();
+        RegisterShuffleEntry::from_bytes(bytes).unwrap()
+    }
+}
+
+#[derive(Debug)]
 pub struct ShuffleSolver {
-    entries: HashMap<ShuffleInput, EntryMap<RegisterShuffleEntry>>,
+    entries: HashMap<ShuffleInput, EntryMap>,
 }
 
 #[derive(Debug)]
@@ -37,7 +59,7 @@ impl<'solver> Solution<'solver> {
 
 #[derive(Debug)]
 struct StateIter<'s> {
-    entries: &'s EntryMap<RegisterShuffleEntry>,
+    entries: &'s EntryMap,
     state: ShuffleState,
 }
 
@@ -125,10 +147,12 @@ impl VariableMap {
 
 impl ShuffleSolver {
     pub fn new() -> Self {
-        // XXX: This is *so* slow in debug mode/testing
-        let entries = postcard::take_from_bytes(super::shuffle_data::SHUFFLE_DATA)
-            .unwrap()
-            .0;
+        let entries: HashMap<ShuffleInput, Vec<u8>> =
+            deserialize_lut(super::shuffle_data::SHUFFLE_DATA).unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|(input, data)| (input, EntryMap::new(&input, data)))
+            .collect();
         Self { entries }
     }
 

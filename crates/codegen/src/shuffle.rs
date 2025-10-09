@@ -2,17 +2,16 @@
 // TODO: Handle 8-bit values. Keep in mind the accumulator is split into A and
 // B registers.
 
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::{cmp::Reverse, io::Write};
+use std::io::{self, Read, Write};
 
+use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
 use fnv::FnvHashMap as HashMap;
-use serde_derive::{Deserialize, Serialize};
 
 use crate::const_vec::{ConstMap, ConstVec};
 
-#[derive(
-    Clone, Copy, Debug, Default, Hash, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub struct State {
     pub reg: [u8; 3],
     pub stack: [u8; 4],
@@ -37,7 +36,7 @@ impl State {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Input {
     pub reg: [u8; 3],
     pub stack: [u8; 3],
@@ -48,6 +47,8 @@ pub struct Input {
 }
 
 impl Input {
+    pub const SIZE: usize = 8;
+
     fn state(&self) -> State {
         let [a, b, c] = self.stack;
         State {
@@ -75,10 +76,28 @@ impl Input {
         }
         n
     }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0..3].copy_from_slice(&self.reg);
+        bytes[3..6].copy_from_slice(&self.stack);
+        bytes[6] = self.num_movable;
+        bytes[7] = self.num_immovable;
+        bytes
+    }
+
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        Self {
+            reg: [bytes[0], bytes[1], bytes[2]],
+            stack: [bytes[3], bytes[4], bytes[5]],
+            num_movable: bytes[6],
+            num_immovable: bytes[7],
+        }
+    }
 }
 
 /// Instruction to use in code gen.
-#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ShuffleInstr {
     /// Load to reg from stack
     Load(u8, u8),
@@ -281,7 +300,7 @@ fn search(input: &Input) -> EntryMap<Entry> {
     work.push(Reverse((0, 0, init)));
 
     print!("input: {:?}, states: {}", input, entries.entries.len());
-    std::io::stdout().flush().unwrap();
+    io::stdout().flush().unwrap();
 
     while let Some(Reverse((c, d, state))) = work.pop() {
         let &Entry { cost, depth, .. } = entries.get(&state);
@@ -366,7 +385,7 @@ fn search(input: &Input) -> EntryMap<Entry> {
 }
 
 /// Publicly consumable solution data
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegisterShuffleEntry {
     pub prev: Option<(State, ShuffleInstr)>,
     pub cost: u16,
@@ -382,20 +401,24 @@ impl From<Entry> for RegisterShuffleEntry {
 }
 
 impl RegisterShuffleEntry {
-    fn from_bytes(bytes: [u8; 12]) -> Option<Self> {
-        let instr = ShuffleInstr::from_bytes([bytes[7], bytes[8], bytes[9]])?;
-        let state = State {
-            reg: [bytes[0], bytes[1], bytes[2]],
-            stack: [bytes[3], bytes[4], bytes[5], bytes[6]],
+    pub const SIZE: usize = 12;
+
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Option<Self> {
+        let instr = ShuffleInstr::from_bytes([bytes[7], bytes[8], bytes[9]]);
+        let prev = if let Some(instr) = instr {
+            let state = State {
+                reg: [bytes[0], bytes[1], bytes[2]],
+                stack: [bytes[3], bytes[4], bytes[5], bytes[6]],
+            };
+            Some((state, instr))
+        } else {
+            None
         };
         let cost = u16::from_le_bytes([bytes[10], bytes[11]]);
-        Some(Self {
-            prev: Some((state, instr)),
-            cost,
-        })
+        Some(Self { prev, cost })
     }
 
-    fn to_bytes(self) -> [u8; 12] {
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; 12];
         if let Some((state, instr)) = self.prev {
             bytes[0..3].copy_from_slice(&state.reg);
@@ -511,18 +534,91 @@ pub fn solve_shuffles() -> HashMap<Input, Vec<RegisterShuffleEntry>> {
     lut
 }
 
-fn entries_to_bytes(entries: &[RegisterShuffleEntry]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(entries.len() * 12);
-    for entry in entries {
-        bytes.extend_from_slice(&entry.to_bytes());
-    }
-    bytes
+pub fn read_n<const N: usize>(mut r: impl Read) -> io::Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
-pub fn serialize_lut(lut: HashMap<Input, Vec<RegisterShuffleEntry>>, w: impl Write) {
-    let lut: HashMap<_, _> = lut
-        .into_iter()
-        .map(|(input, entries)| (input, entries_to_bytes(&entries)))
-        .collect();
-    postcard::to_io(&lut, w).unwrap();
+pub fn serialize_lut(
+    lut: &HashMap<Input, Vec<RegisterShuffleEntry>>,
+    mut w: impl Write,
+) -> io::Result<()> {
+    w.write_u32::<NativeEndian>(lut.len() as u32)?;
+    for (input, entries) in lut.iter() {
+        let input_bytes = input.to_bytes();
+        w.write_all(&input_bytes)?;
+        w.write_u32::<NativeEndian>((entries.len() * RegisterShuffleEntry::SIZE) as u32)?;
+        for entry in entries.iter() {
+            let entry_bytes = entry.to_bytes();
+            w.write_all(&entry_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn deserialize_lut(mut r: impl Read) -> io::Result<HashMap<Input, Vec<u8>>> {
+    let mut lut: HashMap<Input, Vec<u8>> = HashMap::default();
+    let count = r.read_u32::<NativeEndian>()?;
+    for _ in 0..count {
+        let input = Input::from_bytes(read_n(&mut r)?);
+        let len = r.read_u32::<NativeEndian>()?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(len as usize);
+        unsafe { bytes.set_len(len as usize) };
+        r.read_exact(&mut bytes)?;
+        lut.insert(input, bytes);
+    }
+    Ok(lut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn serialize_roundtrip() -> io::Result<()> {
+        let input = Input {
+            reg: [1, 2, 0],
+            stack: [3, 4, 0],
+            num_movable: 2,
+            num_immovable: 1,
+        };
+
+        let state = State {
+            reg: [5, 6, 7],
+            stack: [8, 9, 10, 0],
+        };
+
+        let entries = vec![
+            RegisterShuffleEntry {
+                prev: Some((state, ShuffleInstr::Copy(0, 1))),
+                cost: 3,
+            },
+            RegisterShuffleEntry {
+                prev: None,
+                cost: 0,
+            },
+        ];
+
+        let mut lut: HashMap<Input, Vec<RegisterShuffleEntry>> = HashMap::default();
+        lut.insert(input, entries.clone());
+
+        let mut buffer = Vec::new();
+        serialize_lut(&lut, &mut buffer)?;
+
+        let decoded = deserialize_lut(Cursor::new(buffer))?;
+        assert_eq!(decoded.len(), 1);
+        let bytes = decoded.get(&input).unwrap();
+        let decoded_entries = bytes
+            .chunks(RegisterShuffleEntry::SIZE)
+            .map(|chunk| {
+                let bytes = chunk.try_into().unwrap();
+                RegisterShuffleEntry::from_bytes(bytes).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_entries, entries);
+
+        Ok(())
+    }
 }

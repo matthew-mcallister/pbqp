@@ -8,8 +8,9 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let path = out_dir.join("shuffle_states.bin");
 
-    if path.exists() {
+    if path.exists() && path.metadata().unwrap().len() > 0 {
         println!("found shuffle states: {:?}", path);
+        return;
     }
 
     let file = File::create(&path).unwrap();
@@ -18,5 +19,5 @@ fn main() {
     let lut = solve_shuffles();
 
     println!("writing to {:?}", path);
-    serialize_lut(lut, file);
+    serialize_lut(&lut, file).unwrap();
 }

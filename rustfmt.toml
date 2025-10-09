@@ -1,2 +1,3 @@
 imports_granularity = "Module"
 group_imports = "StdExternalCrate"
+single_line_let_else_max_width = 80

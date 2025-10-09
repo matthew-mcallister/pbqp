@@ -317,8 +317,8 @@ mod tests {
                 Some((v2, Floating)),
             ],
             anchored: [],
-            cost: 24,
-            instructions: [],
+            cost: 12,
+            instructions: [Store(0, 0), Copy(2, 0), Copy(1, 2), Load(0, 1), DeleteStack(0)],
         }
 
         test_case! {
